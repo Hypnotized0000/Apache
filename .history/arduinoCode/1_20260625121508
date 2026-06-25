@@ -1,0 +1,277 @@
+/*
+* SECURE CHANNEL - encrypted link monitor
+* Arduino Uno + Adafruit 2.8" TFT Touch Shield v2 (ILI9341)
+*
+* Libraries: Adafruit GFX, Adafruit ILI9341, Adafruit BusIO
+* Display: hardware SPI via ICSP header, CS=10, D/C=9
+*/
+ 
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <avr/pgmspace.h>
+ 
+#define TFT_CS 10
+#define TFT_DC  9
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
+ 
+/* ---- palette (RGB565) ---- */
+#define RGB565(r,g,b) ((uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3)))
+const uint16_t COL_BG     = RGB565(  6, 10, 16);
+const uint16_t COL_PANEL  = RGB565( 13, 20, 32);
+const uint16_t COL_HEADER = RGB565(  8, 38, 50);
+const uint16_t COL_LINE   = RGB565( 28, 48, 64);
+const uint16_t COL_CYAN   = RGB565( 44, 200, 255);
+const uint16_t COL_GREEN  = RGB565(  0, 230, 140);
+const uint16_t COL_AMBER  = RGB565(255, 176,  48);
+const uint16_t COL_HEX    = RGB565(  0, 150,  92);
+const uint16_t COL_TEXT   = RGB565(214, 228, 238);
+const uint16_t COL_DIM    = RGB565(108, 130, 150);
+const uint16_t COL_RXBG   = RGB565(  8, 30, 42);
+const uint16_t COL_TXBG   = RGB565( 40, 30,  8);
+ 
+/* ---- layout ---- */
+const int W = 320, H = 240;
+const int PANEL_Y = 46, PANEL_H = 106;
+const int ST_LINE = 53, HEXA = 70, HEXB = 82, PROG_Y = 98, REVEAL_Y = 120;
+const int REC_Y[3] = {168, 184, 200};
+const int FOOT_Y = 216;
+ 
+/* ---- message pool (PROGMEM) ---- */
+const char m00[] PROGMEM = "Handshake verified. Link secured.";
+const char m01[] PROGMEM = "Key rotation complete. Cycle 1F.";
+const char m02[] PROGMEM = "Telemetry uplink nominal.";
+const char m03[] PROGMEM = "Packet 0x4F acknowledged.";
+const char m04[] PROGMEM = "Coordinates received. Standing by.";
+const char m05[] PROGMEM = "Authorization token accepted.";
+const char m06[] PROGMEM = "GPS lock confirmed. 12 satellites.";
+const char m07[] PROGMEM = "Payload integrity check passed.";
+const char m08[] PROGMEM = "Rerouting via relay node 03.";
+const char m09[] PROGMEM = "Signal stable at -67 dBm.";
+const char m10[] PROGMEM = "Session key renewed.";
+const char m11[] PROGMEM = "Buffer flushed. Ready to sync.";
+const char m12[] PROGMEM = "Firmware checksum verified.";
+const char m13[] PROGMEM = "Heartbeat ack. Uptime 14h22m.";
+const char m14[] PROGMEM = "New peer authenticated.";
+const char m15[] PROGMEM = "Time drift 2ms. Corrected.";
+const char m16[] PROGMEM = "Command queue cleared.";
+const char m17[] PROGMEM = "Secure tunnel re-established.";
+const char* const MSG[] PROGMEM = {
+  m00,m01,m02,m03,m04,m05,m06,m07,m08,m09,m10,m11,m12,m13,m14,m15,m16,m17 };
+const uint8_t MSG_COUNT = 18;
+ 
+const char* LOCAL  = "ND-7A3F";
+const char* REMOTE = "ND-15C2";
+ 
+/* ---- state ---- */
+struct Entry { uint8_t dir; char text[40]; };  // dir: 1=TX, 0=RX
+Entry recent[3];
+uint8_t recentCount = 0;
+bool    txTurn = true;
+uint16_t pktCount = 1040;
+uint16_t txK = 12, rxK = 9;
+uint8_t  lastMsg = 255;
+bool     cursorOn = false;
+ 
+/* ---------- small graphics helpers ---------- */
+void printAt(int x, int y, const char* s, uint8_t size, uint16_t col) {
+  tft.setTextSize(size); tft.setTextColor(col); tft.setCursor(x, y); tft.print(s);
+}
+void printRight(int xr, int y, const char* s, uint8_t size, uint16_t col) {
+  printAt(xr - (int)strlen(s) * 6 * size, y, s, size, col);
+}
+void hLine(int y, uint16_t c) { tft.drawFastHLine(0, y, W, c); }
+ 
+void drawLock(int x, int y, uint16_t c) {            // ~11 x 13
+  tft.drawRoundRect(x + 2, y, 7, 9, 3, c);           // shackle
+  tft.drawRoundRect(x + 3, y, 5, 9, 2, c);
+  tft.fillRoundRect(x, y + 6, 11, 8, 2, c);          // body
+  tft.drawFastVLine(x + 5, y + 9, 3, COL_BG);        // keyhole
+}
+void drawArrow(int x, int y, bool right, uint16_t c) {   // 7x9 triangle
+  if (right) tft.fillTriangle(x, y, x, y + 8, x + 6, y + 4, c);
+  else       tft.fillTriangle(x + 6, y, x + 6, y + 8, x, y + 4, c);
+}
+void drawSignal(int x, int y, uint8_t level) {       // 4 bars rising to y
+  for (uint8_t i = 0; i < 4; i++) {
+    int bh = 4 + i * 3, bx = x + i * 5;
+    tft.fillRect(bx, y - bh, 4, bh, (i < level) ? COL_GREEN : COL_LINE);
+  }
+}
+ 
+/* state chip on the right of the panel's top line */
+void drawChip(const char* s, uint16_t col) {
+  tft.fillRect(196, ST_LINE - 3, 116, 15, COL_PANEL);
+  int w = (int)strlen(s) * 6 + 10;
+  int x = 312 - w;
+  tft.drawRoundRect(x, ST_LINE - 3, w, 14, 3, col);
+  printAt(x + 5, ST_LINE, s, 1, col);
+}
+ 
+/* random hex blocks, redrawn each frame to "scramble" */
+void streamHex(int y, uint8_t groups) {
+  tft.fillRect(12, y, 298, 9, COL_PANEL);
+  int x = 12;
+  for (uint8_t g = 0; g < groups; g++) {
+    for (uint8_t i = 0; i < 4; i++) {
+      char c = "0123456789ABCDEF"[random(16)];
+      char s[2] = { c, 0 };
+      printAt(x, y, s, 1, COL_HEX);
+      x += 6;
+    }
+    x += 6;
+  }
+}
+ 
+void drawProgress(uint8_t pct, uint16_t col) {
+  int x = 12, w = 218, h = 9;
+  tft.drawRoundRect(x, PROG_Y, w, h, 2, COL_LINE);
+  int fw = (int)((long)(w - 2) * pct / 100);
+  tft.fillRect(x + 1, PROG_Y + 1, fw, h - 2, col);
+  tft.fillRect(x + 1 + fw, PROG_Y + 1, (w - 2) - fw, h - 2, COL_PANEL);
+}
+ 
+/* typewriter reveal of the decrypted plaintext */
+void revealText(const char* s, uint16_t col) {
+  tft.fillRect(28, REVEAL_Y, 284, 10, COL_PANEL);
+  int x = 28;
+  tft.setTextSize(1); tft.setTextColor(col);
+  for (uint8_t i = 0; s[i]; i++) {
+    tft.setCursor(x, REVEAL_Y); tft.print(s[i]); x += 6;
+    delay(16);
+  }
+}
+ 
+/* ---------- recent transcript (chat bubbles) ---------- */
+void drawRecentRow(uint8_t slot) {
+  int y = REC_Y[slot];
+  tft.fillRect(0, y - 3, W, 16, COL_BG);
+  uint8_t idx = 2 - slot;            // bottom row (slot 2) shows newest = recent[0]
+  if (idx >= recentCount) return;
+  Entry &e = recent[idx];
+  bool tx = e.dir;
+  int tw = (int)strlen(e.text) * 6;
+  int bw = tw + 30; if (bw > 250) bw = 250;
+  int bx = tx ? (316 - bw) : 4;
+  tft.fillRoundRect(bx, y - 3, bw, 15, 4, tx ? COL_TXBG : COL_RXBG);
+  uint16_t col = tx ? COL_AMBER : COL_CYAN;
+  drawArrow(bx + 5, y, tx, col);
+  printAt(bx + 16, y, e.text, 1, col);
+  drawLock(bx + bw - 13, y - 1, col);
+}
+void drawRecentAll() { for (uint8_t i = 0; i < 3; i++) drawRecentRow(i); }
+ 
+void pushRecent(uint8_t dir, const char* text) {
+  if (recentCount < 3) recentCount++;
+  for (int i = 2; i > 0; i--) recent[i] = recent[i - 1];  // recent[0] = newest
+  recent[0].dir = dir;
+  strncpy(recent[0].text, text, 39); recent[0].text[39] = 0;
+  drawRecentAll();
+}
+ 
+/* ---------- status + footer ---------- */
+void drawStatus() {
+  tft.fillRect(0, 27, W, 18, COL_BG);
+  printAt(8, 31, "AES-256-GCM", 1, COL_CYAN);
+  tft.drawFastVLine(118, 28, 16, COL_LINE);
+  printAt(126, 31, "PEER ", 1, COL_DIM);
+  printAt(156, 31, REMOTE, 1, COL_TEXT);
+  tft.drawFastVLine(232, 28, 16, COL_LINE);
+  char rtt[12]; sprintf(rtt, "RTT %2dms", (int)random(28, 60));
+  printRight(312, 31, rtt, 1, COL_AMBER);
+}
+ 
+void drawFooter() {
+  tft.fillRect(0, FOOT_Y, W, H - FOOT_Y, COL_PANEL);
+  tft.drawFastHLine(0, FOOT_Y, W, COL_LINE);
+  tft.fillCircle(10, FOOT_Y + 12, 4, COL_GREEN);
+  printAt(20, FOOT_Y + 8, "ENCRYPTED", 1, COL_GREEN);
+  printAt(108, FOOT_Y + 8, "KEY 9F3C:1A:E1", 1, COL_DIM);
+  char th[20]; sprintf(th, "TX%uK RX%uK", txK, rxK);
+  printAt(218, FOOT_Y + 8, th, 1, COL_TEXT);
+  tft.fillRect(305, FOOT_Y + 7, 7, 10, cursorOn ? COL_GREEN : COL_PANEL);
+}
+ 
+/* ---------- static frame ---------- */
+void drawFrame() {
+  tft.fillScreen(COL_BG);
+  // header
+  tft.fillRect(0, 0, W, 26, COL_HEADER);
+  hLine(26, COL_LINE);
+  drawLock(8, 6, COL_GREEN);
+  printAt(26, 6, "SECURE CHANNEL", 2, COL_TEXT);
+  drawSignal(250, 20, 4);
+  tft.fillCircle(304, 13, 4, COL_GREEN);
+  // panel
+  tft.fillRoundRect(4, PANEL_Y, 312, PANEL_H, 4, COL_PANEL);
+  tft.drawRoundRect(4, PANEL_Y, 312, PANEL_H, 4, COL_LINE);
+  // recent label
+  printAt(8, 158, "TRANSCRIPT", 1, COL_DIM);
+  tft.drawFastHLine(78, 162, 234, COL_LINE);
+}
+ 
+/* ---------- one message exchange ---------- */
+void runExchange() {
+  bool tx = txTurn; txTurn = !txTurn;
+  uint8_t idx; do { idx = random(MSG_COUNT); } while (idx == lastMsg);
+  lastMsg = idx;
+  char plain[40];
+  strcpy_P(plain, (PGM_P)pgm_read_word(&(MSG[idx])));
+  uint16_t col = tx ? COL_AMBER : COL_CYAN;
+  const char* node = tx ? LOCAL : REMOTE;
+ 
+  // clear panel interior
+  tft.fillRoundRect(5, PANEL_Y + 1, 310, PANEL_H - 2, 4, COL_PANEL);
+  drawArrow(12, ST_LINE, tx, col);
+  printAt(24, ST_LINE, tx ? "TX" : "RX", 1, col);
+  printAt(44, ST_LINE, node, 1, COL_TEXT);
+ 
+  // ENCRYPTING
+  drawChip("ENCRYPTING", COL_AMBER);
+  for (uint8_t f = 0; f <= 8; f++) {
+    streamHex(HEXA, 11); streamHex(HEXB, 11);
+    drawProgress(f * 5, COL_AMBER);
+    delay(42);
+  }
+  // TRANSMITTING
+  drawChip("TRANSMITTING", COL_CYAN);
+  for (uint8_t f = 0; f <= 8; f++) {
+    streamHex(HEXA, 11); streamHex(HEXB, 11);
+    drawProgress(40 + f * 6, COL_CYAN);
+    txK += random(0, 2); rxK += random(0, 2);
+    delay(42);
+  }
+  // DECRYPTING
+  drawChip("DECRYPTING", COL_GREEN);
+  drawProgress(100, COL_GREEN);
+  delay(140);
+  drawLock(12, REVEAL_Y - 1, COL_GREEN);
+  revealText(plain, col);
+  drawChip("VERIFIED", COL_GREEN);
+ 
+  // commit + stats
+  pktCount++;
+  if (tx) txK += random(1, 4); else rxK += random(1, 4);
+  pushRecent(tx ? 1 : 0, plain);
+  drawStatus();
+  cursorOn = !cursorOn;
+  drawFooter();
+ 
+  delay(650);
+}
+ 
+void setup() {
+  randomSeed(analogRead(A5) + analogRead(A4));
+  tft.begin();
+  tft.setRotation(1);
+  drawFrame();
+  drawStatus();
+  drawFooter();
+  // seed a couple of history lines so it looks mid-session
+  pushRecent(0, "Session established.");
+  pushRecent(1, "Authenticating peer...");
+}
+ 
+void loop() {
+  runExchange();
+}

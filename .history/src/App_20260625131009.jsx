@@ -94,6 +94,7 @@ export default function App() {
         <section className="hero" aria-labelledby="hero-title">
           <div className="hero-inner">
             <div className="hero-text">
+              <p className="eyebrow">Beveiligde communicatie over LoRaWAN</p>
               <h1 id="hero-title">Apache</h1>
               <p className="hero-statement">Als elke minuut telt, moet hulp weten waar je bent.</p>
               <p className="hero-copy">
@@ -124,6 +125,7 @@ export default function App() {
         <section id="kanaal" className="channel-section" aria-labelledby="channel-title">
           <div className="channel-section-inner">
             <header className="channel-intro">
+              <p className="eyebrow eyebrow-light">Live demo</p>
               <h2 id="channel-title">Stuur het device een versleuteld bericht.</h2>
               <p className="section-lead section-lead-light">
                 Verbind met het Apache-device naast je. Je tekst wordt in de browser versleuteld,
@@ -138,6 +140,7 @@ export default function App() {
         <section id="werking" className="content-section" aria-labelledby="work-title">
           <div className="section-shell">
             <header className="section-head">
+              <p className="eyebrow">Werking</p>
               <h2 id="work-title">Hoe werkt Apache?</h2>
             </header>
             <ol className="steps">
@@ -159,6 +162,7 @@ export default function App() {
         <section id="lorawan" className="content-section alt" aria-labelledby="lorawan-title">
           <div className="section-shell">
             <header className="section-head">
+              <p className="eyebrow">LoRaWAN</p>
               <h2 id="lorawan-title">Waarom LoRaWAN?</h2>
             </header>
             <div className="lorawan-body">
